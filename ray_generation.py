@@ -41,6 +41,20 @@ def ray_generation(H: int, W: int, focal_length: float, c2w: torch.Tensor) -> to
 
     return ray_origins, ray_directions_world
 
+def hierarchical_sampling(bins: int, weights: torch.tensor, num_samples: int, uniform=False):
+    '''
+    Hierarchical sampling -> to sample more points from those positions we expect to have visual content
+    Based on the evaluation of the 'coarse' network on stratified samples
+    Parameters:
+        bins:           Number of bins used for stratified sampling
+        weights:        Weights for the bins
+        num_samples:    Number of samples
+        uniform:        Whether to perform uniform sampling
+    '''
+
+    pdf = weights / torch.sum(weights, dim=-1)
+
+    pass
 def rays_ndc(H, W, focal, near, rays_origin, rays_direction):
     '''
     Generate the rays in NDC space (Normalized Device Coordinates)
