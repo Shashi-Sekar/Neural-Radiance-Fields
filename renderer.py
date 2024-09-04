@@ -63,7 +63,8 @@ def hierarchical_sampling(bins: torch.tensor, weights: torch.tensor, num_samples
     cdf = torch.cumsum(pdf, dim=-1)
     
     #Add zero as the first entry -> CDF is 0 for values < a if the domain is [a, b], shape: (num_rays, num_samples+1)
-    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)
+    zeros = torch.zeros_like(cdf[..., :1])
+    cdf = torch.cat([zeros, cdf], dim=-1)
 
     #Generate random samples from a uniform distribution (0, 1)
     if uniform:
@@ -85,8 +86,11 @@ def hierarchical_sampling(bins: torch.tensor, weights: torch.tensor, num_samples
     indices = torch.searchsorted(cdf, u, right=True)
 
     #Avoid out of bounds
-    lower_bound = torch.max(torch.zeros_like(indices-1), indices-1)
-    higher_bound = torch.min(torch.ones_like(indices)*num_samples, indices)
+    zeros = torch.zeros_like(indices-1)
+    lower_bound = torch.max(zeros, indices-1)
+    
+    max_index = torch.ones_like(indices)*num_samples
+    higher_bound = torch.min(max_index, indices)
     indices_bound = torch.stack([lower_bound, higher_bound], dim = -1)
     
     #Matching the the number dimensions of CDF and indices
@@ -121,6 +125,9 @@ def rays_ndc(H, W, focal, near, rays_origin, rays_direction):
         rays_o: Ray origins in NDC space (Batch_size, 3)
         rays_d: Ray directions in NDC space (Batch_size, 3)
     '''
+    pass
+
+def render():
     pass
 
 if __name__ == "__main__":
