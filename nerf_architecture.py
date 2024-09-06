@@ -53,7 +53,6 @@ class NeRF(nn.Module):
 
         #Volume Density
         density = self.volume_layer(out)
-        density = F.relu(density)   
 
         #Feature
         features = self.feature_layer(out)
