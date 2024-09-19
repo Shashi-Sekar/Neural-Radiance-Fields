@@ -18,6 +18,12 @@ from nerf_architecture import NeRF
 #Convert the image to 8-bit format
 to8b = lambda x : (255*np.clip(x, 0, 1)).astype(np.uint8)
 
+#Convert the output of the model to volume density value and then to alpha 
+#This is due to computation of the continuous volumetric rendering using quadrature rule (use discrete set of samples to estimate the integral)
+#Alpha is 1 - exp(-sigma * delta) -> sigma is the density, delta is the distance between the samples
+# Note: The volume density output by the model needs to be rectified to ensure it is positive
+raw2alpha = lambda raw, delta, act_fn=F.relu(): 1.-torch.exp(-act_fn(raw)*delta)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def ray_generation(H: int, W: int, focal_length: float, c2w: torch.Tensor) -> Tuple[torch.Tensor, torch.tensor]:
@@ -138,6 +144,24 @@ def ray_generation_given_coordinates(H: int, W: int, focal_length: float, c2w: n
 
     return ray_origins, ray_directions_world
 
+def rays_ndc(H, W, focal, near, rays_origin, rays_direction):
+    '''
+    Generate the rays in NDC space (Normalized Device Coordinates)
+    This is commonly used in triangle rasterization pipeline
+    Clipping out points that lie before the near plane
+    Parameters:
+        H: Height of the image
+        W: Width of the image
+        focal: Focal length of the camera
+        near: Near bound for the scene
+        rays_origin: Ray origins for each pixel in the image (Batch_size, 3)
+        rays_direction: Ray directions for each pixel in the image (Batch_size, 3)
+    Outputs:
+        rays_o: Ray origins in NDC space (Batch_size, 3)
+        rays_d: Ray directions in NDC space (Batch_size, 3)
+    '''
+    pass
+
 def importance_sampling(bins: torch.tensor, weights: torch.tensor, num_samples: int, uniform=False):
     '''
     Hierarchical sampling -> to sample more points from those positions we expect to have visual content
@@ -211,7 +235,7 @@ def importance_sampling(bins: torch.tensor, weights: torch.tensor, num_samples: 
 
     return samples
 
-def stratified_sampling(near, far, num_samples, lindisp=True,  jitter=0.):
+def stratified_sampling(near, far, num_samples, lindisp=True, jitter=0.):
     '''
     Stratified Sampling
     Parameters:
@@ -221,18 +245,19 @@ def stratified_sampling(near, far, num_samples, lindisp=True,  jitter=0.):
         lindisp: Whether to sample linearly in inverse depth
         jitter: Stratified sampling
     Outputs:
-        samples: Stratified samples
+        samples: Stratified samples (num_rays, num_samples)
     '''
-    batch_size = near.shape[0]
+    num_rays = near.shape[0]
 
     #Sample points between 0 and 1 and then scale them to lie between near and far
+            ############    WHY CAN'T DIRECTLY SAMPLE BETWEEN NEAR AND FAR?    ############
     u = torch.linspace(0., 1., steps=num_samples)
     if lindisp:
         z_vals = 1./(1./near * (1-u) + 1./far * u)
     else:
         z_vals = near*(1-u) + far*u
 
-    z_vals = z_vals.expand(batch_size, num_samples)
+    z_vals = z_vals.expand(num_rays, num_samples)
 
     if jitter > 0.:
         #need to jitter around the midpoints of the intervals adding non-uniformity
@@ -246,24 +271,68 @@ def stratified_sampling(near, far, num_samples, lindisp=True,  jitter=0.):
         z_vals = lower + t_rand * (upper - lower)
 
     return z_vals
-    
-def rays_ndc(H, W, focal, near, rays_origin, rays_direction):
+
+def sigma_loss(rays_o, rays_d, viewdirs, near, far, depths, run_func, network, N_samples, perturb, raw_noise_std, err=1):
     '''
-    Generate the rays in NDC space (Normalized Device Coordinates)
-    This is commonly used in triangle rasterization pipeline
-    Clipping out points that lie before the near plane
+    Depth Supervised Loss and Color Loss
     Parameters:
-        H: Height of the image
-        W: Width of the image
-        focal: Focal length of the camera
-        near: Near bound for the scene
-        rays_origin: Ray origins for each pixel in the image (Batch_size, 3)
-        rays_direction: Ray directions for each pixel in the image (Batch_size, 3)
-    Outputs:
-        rays_o: Ray origins in NDC space (Batch_size, 3)
-        rays_d: Ray directions in NDC space (Batch_size, 3)
+        rays_o: Ray origins for each pixel in the image (batch_size, 3)
+        rays_d: Ray directions for each pixel in the image (batch_size, 3)
+        viewdirs: View directions (batch_size, 3)
+        near: Near bound for the scene (batch_size)
+        far: Far bound for the scene (batch_size)
+        depths: Depth values (batch_size)
+        run_func: Function to pass queries to the model
+        network: Model to predict the RGB and density at each sampled point
+        N_samples: Number of samples
+        perturb: Perturb the depth values
+        raw_noise_std: Raw noise standard deviation
+        err: Error threshold
     '''
-    pass
+
+    num_rays = rays_o.shape[0]
+    t_vals = torch.linspace(0., 1., N_samples).to(device)
+    t_vals = t_vals.expand(num_rays, N_samples)
+
+    #Stratified Sampling
+    # (num_rays, num_samples)
+    z_vals = stratified_sampling(near, far, N_samples, True, 0.)
+
+    #Samples along the ray direction and from the ray origin
+    # (num_rays, num_samples, 3)
+    sampled_pts = rays_o[...,np.newaxis,:] + rays_d[...,np.newaxis,:] * z_vals[..., :, np.newaxis]
+    
+    raw = run_func(sampled_pts, viewdirs, network)
+
+    noise = 0.
+    if raw_noise_std > 0.1:
+        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+    
+    #Calculate the distance between adjacent samples
+    # (num_rays, num_samples-1)
+    delta = z_vals[...,1:] - z_vals[...,:-1]
+
+    #Distance from the last sample is infinity
+    # (num_rays, num_samples)
+    delta = torch.cat([delta, torch.tensor([1e10]).to(device).expand(delta[...,:1].shape)], -1)
+
+    #Multiply the distances by the norm of ray direction to scale it, (num_rays, num_samples)
+    delta = delta * torch.norm(rays_d[..., None,:], dim=-1)
+
+    #Volume Density, (num_ray, num_samples)
+    alpha = raw2alpha(raw[..., 3] + noise, delta)
+
+    #Ray termination distribution, 'h'
+    #Calculate the accumulated transmittance using alpha
+    # (num_rays, num_samples)
+    T = torch.cumprod(torch.cat([torch.ones(alpha.shape[0], 1).to(device), 1.-alpha + 1e-10], dim=-1), dim=-1)[:,:-1]
+    weights = alpha * T
+
+    #Depth Loss
+    loss = -torch.log(weights + 1e-5) * torch.exp(-(z_vals - depths[:,None]) ** 2 / (2 * err)) * delta
+    loss = torch.sum(loss, -1)
+
+    return loss
 
 def batchify_rays(rays_info, batch_size):
     '''
@@ -306,14 +375,17 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_background=False, py
     '''
 
     #Calculate the distance between adjacent samples
+    # (num_rays, num_samples-1)
     delta = z_vals[..., 1:] - z_vals[..., :-1]
+
     #Distance from the last sample is infinity
+    # (num_rays, num_samples)
     delta = torch.cat([delta, torch.tensor([1e10]).to(device).expand(delta[...,:1])], dim=-1)
 
-    #Multiply the distances by the norm of ray direction to convert to world space, (batch_size, num_samples)
+    #Multiply the distances by the norm of ray direction to scale it, (batch_size, num_samples)
     delta = delta * torch.norm(rays_d[..., np.newaxis, :], dim=-1)
 
-    #Extract the RGB values, (batch_size, num_samples, 3)
+    #Extract the RGB values, (num_rays, num_samples, 3)
     rgb = raw[..., :3]
     
     #Adding noise to the prediction. Acts as a regularizer
@@ -322,25 +394,24 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_background=False, py
         noise = torch.randn(raw[..., :3].shape) * raw_noise_std
         noise = noise.to(device)
 
-    raw2alpha = lambda raw, delta, act_fn=F.relu(): 1.-torch.exp(-act_fn(raw)*delta)
-
-    #Volume Density, (batch_size, num_samples)
+    #Volume Density, (num_rays, num_samples)
     alpha = raw2alpha(raw[..., 3] + noise, delta)
     
-    #Computing the weights, (batch_size, num_samples)
+    #Ray termination distribution, 'h'
+    #Computing the weights, (num_rays, num_samples)
     T = torch.cumprod(torch.cat([torch.ones(alpha.shape[0], 1).to(device), 1.-alpha + 1e-10], dim=-1), dim=-1)[:,:-1]
     weights = alpha * T
 
-    #Compute the RGB Map, (batch_size, 3)
+    #Compute the RGB Map, (num_rays, 3)
     rgb_map = torch.sum(weights[..., np.newaxis] * rgb, dim=-2)
 
-    #Depth Map is the expected distance, (batch_size)
+    #Depth Map is the expected distance, (num_rays)
     depth_map = torch(weights * z_vals, dim=-1)
     
     #Disparity is inverse depth
     inv_depth_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, dim=-1))
 
-    #Accumulated weights, (batch_size)
+    #Accumulated weights, (num_rays)
     acc_map = torch.sum(weights, dim=-1)
 
     if white_background:
