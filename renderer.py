@@ -235,12 +235,13 @@ def importance_sampling(bins: torch.tensor, weights: torch.tensor, num_samples: 
 
     return samples
 
-def stratified_sampling(near, far, num_samples, lindisp=True, jitter=0.):
+def stratified_sampling(near, far, num_samples, num_rays, lindisp=True, jitter=0.):
     '''
     Stratified Sampling
     Parameters:
         near: Near bound for the scene
         far: Far bound for the scene
+        num_rays: Number of rays
         num_samples: Number of samples
         lindisp: Whether to sample linearly in inverse depth
         jitter: Stratified sampling
@@ -275,6 +276,9 @@ def stratified_sampling(near, far, num_samples, lindisp=True, jitter=0.):
 def sigma_loss(rays_o, rays_d, viewdirs, near, far, depths, run_func, network, N_samples, perturb, raw_noise_std, err=1):
     '''
     Depth Supervised Loss and Color Loss
+    
+    Objective - Minimize the KL divergence between the noisy estimates of the SFM keypoint's depth and the rendered ray distribution
+
     Parameters:
         rays_o: Ray origins for each pixel in the image (batch_size, 3)
         rays_d: Ray directions for each pixel in the image (batch_size, 3)
@@ -296,7 +300,7 @@ def sigma_loss(rays_o, rays_d, viewdirs, near, far, depths, run_func, network, N
 
     #Stratified Sampling
     # (num_rays, num_samples)
-    z_vals = stratified_sampling(near, far, N_samples, True, 0.)
+    z_vals = stratified_sampling(near, far, num_rays, N_samples, True, 0.)
 
     #Samples along the ray direction and from the ray origin
     # (num_rays, num_samples, 3)
@@ -516,7 +520,7 @@ def volumetric_rendering(rays_info, network_fn, network_query_fn, N_samples, ret
     near = near.unsqueeze(-1) #(batch_size, 1)
     far = far.unsqueeze(-1) #(batch_size, 1)
     
-    z_vals = stratified_sampling(near, far, N_samples, lindisp, jitter)
+    z_vals = stratified_sampling(near, far, batch_size, N_samples, lindisp, jitter)
     
     #Samples along the ray direction and from the ray origin
     sampled_pts = rays_o[...,np.newaxis,:] + rays_d[...,np.newaxis,:] * z_vals[..., :, np.newaxis]
