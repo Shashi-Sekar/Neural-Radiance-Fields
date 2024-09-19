@@ -8,6 +8,7 @@ import time
 import json
 import random
 import imageio
+from typing import Tuple
 
 from tqdm import tqdm
 
@@ -19,7 +20,7 @@ to8b = lambda x : (255*np.clip(x, 0, 1)).astype(np.uint8)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def ray_generation(H: int, W: int, focal_length: float, c2w: torch.Tensor) -> torch.Tensor:
+def ray_generation(H: int, W: int, focal_length: float, c2w: torch.Tensor) -> Tuple[torch.Tensor, torch.tensor]:
     '''
     Generate the ray origins and directions for each pixel in the image
     Parameter:
@@ -56,6 +57,84 @@ def ray_generation(H: int, W: int, focal_length: float, c2w: torch.Tensor) -> to
     #Ray Origin -> Translation of the camera from the world origin
     #Last column of c2w matrix
     ray_origins = c2w[:3, -1].expand(ray_directions_world.shape)
+
+    return ray_origins, ray_directions_world
+
+def ray_generation_numpy(H: int, W: int, focal_length: float, c2w: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    '''
+    Numpy version of ray generation
+    Parameters:
+        H: Height of the image
+        W: Width of the image
+        focal_length: Focal length of the camera
+        c2w: Camera to world transformation matrix (4, 4) -> [R | t][0,0,0,1]
+    Outputs:
+        ray_origins: Ray origins for each pixel in the image (H, W, 3)
+        ray_directions: Ray directions for each pixel in the image (H, W, 3)
+    '''
+    #Get the image coordinates
+    i, j = np.meshgrid(torch.arange(W, dtype=np.float32), np.arange(H, dtype=torch.float32), indexing='xy')
+
+    #Center the image aroud the origin (center of the image plane)
+    i = i - W/2
+    j = j - H/2
+
+    #Scaling the image coorindates
+    i = i / focal_length
+    j = j / focal_length
+
+    #Compute the ray directions
+    #(x, y, -1) - (0, 0, 0) -> (x, y, -1)
+    #Camera orientation in the negative z-direction
+    #(W, H, 3)
+    ray_directions = np.stack([i, j, -np.ones_like(i)], axis=-1)
+    
+    #Tranform the ray directions from camera space to world space
+    #(W, H, 1, 3) * (3, 3) (Broadcast) -> (W, H, 3, 3) ->(Sum) (W, H, 3)
+    ray_directions_world = np.sum(ray_directions[..., np.newaxis, :] * c2w[:3, :3], dim=-1)
+
+    #Ray Origin -> Translation of the camera from the world origin
+    #Last column of c2w matrix
+    ray_origins = np.broadcast_to(c2w[:3, -1], np.shape(ray_directions_world))
+
+    return ray_origins, ray_directions_world
+
+def ray_generation_given_coordinates(H: int, W: int, focal_length: float, c2w: np.ndarray, coordinates: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    '''
+    Generate ray origins and directions for the given coordinates in the image
+    Parameters:
+        H: Height of the image
+        W: Width of the image
+        focal_length: Focal length of the camera
+        coordinates: Coordinates in the image (N, 2)
+    Outputs:
+        ray_origins: Ray origins for the given coordinates (N, 3)
+        ray_directions: Ray directions for the given coordinates (N, 3)
+    '''
+
+    i, j = coordinates[:, 0], coordinates[:, 1]
+
+    #Center the image aroud the origin (center of the image plane)
+    i = i - W/2
+    j = j - H/2
+
+    #Scaling the image coorindates
+    i = i / focal_length
+    j = j / focal_length
+
+    #Compute the ray directions
+    #(x, y, -1) - (0, 0, 0) -> (x, y, -1)
+    #Camera orientation in the negative z-direction
+    #(W, H, 3)
+    ray_directions = np.stack([i, j, -np.ones_like(i)], axis=-1)
+    
+    #Tranform the ray directions from camera space to world space
+    #(W, H, 1, 3) * (3, 3) (Broadcast) -> (W, H, 3, 3) ->(Sum) (W, H, 3)
+    ray_directions_world = np.sum(ray_directions[..., np.newaxis, :] * c2w[:3, :3], dim=-1)
+
+    #Ray Origin -> Translation of the camera from the world origin
+    #Last column of c2w matrix
+    ray_origins = np.broadcast_to(c2w[:3, -1], np.shape(ray_directions_world))
 
     return ray_origins, ray_directions_world
 
@@ -132,7 +211,7 @@ def importance_sampling(bins: torch.tensor, weights: torch.tensor, num_samples: 
 
     return samples
 
-def stratified_smapling(near, far, num_samples, lindisp=True,  jitter=0.):
+def stratified_sampling(near, far, num_samples, lindisp=True,  jitter=0.):
     '''
     Stratified Sampling
     Parameters:
@@ -330,10 +409,11 @@ def render(H, W, focal, batch_size=1024*32, rays=None, c2w=None, ndc=True, near=
 
     return ret_list + [ret_dict]
 
-def volumetric_rendering(rays_info, network_fn, network_query_fn, N_samples, retraw=False, lindisp=False, jitter=0., N_importance=0, nework_fine=None, white_background=False, raw_noise_std=0., verbose=False, pytest=False, sigma_loss=None):
+def volumetric_rendering(rays_info, network_fn, network_query_fn, N_samples, retraw=False, lindisp=False, jitter=0., N_importance=0, network_fine=None, white_background=False, raw_noise_std=0., verbose=False, pytest=False, sigma_loss=None):
     '''
     Volumetric Rendering
-        1. 
+        1. Stratified Sampling
+        2. 
     Parameters:
         rays_info: Ray information -> origin, direction, near, far, viewdirs, depth (if true) (batch_size, 3+3+1+1+3+1)
         network_fn: Model to predict the RGB and density at each sampled point
@@ -365,7 +445,7 @@ def volumetric_rendering(rays_info, network_fn, network_query_fn, N_samples, ret
     near = near.unsqueeze(-1) #(batch_size, 1)
     far = far.unsqueeze(-1) #(batch_size, 1)
     
-    z_vals = stratified_smapling(near, far, N_samples, lindisp, jitter)
+    z_vals = stratified_sampling(near, far, N_samples, lindisp, jitter)
     
     #Samples along the ray direction and from the ray origin
     sampled_pts = rays_o[...,np.newaxis,:] + rays_d[...,np.newaxis,:] * z_vals[..., :, np.newaxis]
