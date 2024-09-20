@@ -147,7 +147,12 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     return poses, bds, imgs
 
 def colmap_depth(basedir, factor=8, bd_factor=0.75):
+    '''
+    Retrieve the depth of keypoints in an image from COLMAP
+    '''
+
     data_file = Path(basedir) / 'colmap_depth.npy'
+    
     
     images = read_images_binary(Path(basedir) / 'sparse' / '0' / 'images.bin')
     points = read_points3d_binary(Path(basedir) / 'sparse' / '0' / 'points3D.bin')
